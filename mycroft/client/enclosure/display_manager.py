@@ -1,49 +1,62 @@
+# Copyright 2017 Mycroft AI Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 
-# Copyright 2017 Mycroft AI, Inc.
-#
-# This file is part of Mycroft Core.
-#
-# Mycroft Core is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-#
-# Mycroft Core is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-#
-# You should have received a copy of the GNU General Public License
-# along with Mycroft Core.  If not, see <http://www.gnu.org/licenses/>.
-from threading import Thread, Timer
-from mycroft.messagebus.client.ws import WebsocketClient
-from mycroft.configuration import ConfigurationManager
-from mycroft.util import get_ipc_directory
+""" DisplayManager
+
+This module provides basic "state" for the visual representation associated
+with this Mycroft instance.  The current states are:
+   ActiveSkill - The skill that last interacted with the display via the
+                 Enclosure API.
+
+Currently, a wakeword sets the ActiveSkill to "wakeword", which will auto
+clear after 10 seconds.
+
+A skill is set to Active when it matches an intent, outputs audio, or
+changes the display via the EnclosureAPI()
+
+A skill is automatically cleared from Active two seconds after audio
+output is spoken, or 2 seconds after resetting the display.
+
+So it is common to have '' as the active skill.
+"""
+
 import json
+from threading import Thread, Timer
+
 import os
-from logging import getLogger
 
-__author__ = 'connorpenrod', 'michaelnguyen'
-
-
-LOG = getLogger("Display Manager (mycroft.client.enclosure)")
-managerIPCDir = os.path.join(get_ipc_directory(), "managers")
+from mycroft.messagebus.client.ws import WebsocketClient
+from mycroft.util import get_ipc_directory
+from mycroft.util.log import LOG
 
 
 def _write_data(dictionary):
-    """Writes the parama as JSON to the
-        IPC dir (/tmp/mycroft/ipc/managers)
-        args:
-            dict: dictionary
+    """ Writes the dictionary of state data to the IPC directory.
+
+    Args:
+        dictionary (dict): information to place in the 'disp_info' file
     """
 
+    managerIPCDir = os.path.join(get_ipc_directory(), "managers")
     # change read/write permissions based on if file exists or not
     path = os.path.join(managerIPCDir, "disp_info")
     permission = "r+" if os.path.isfile(path) else "w+"
 
     if permission == "w+" and os.path.isdir(managerIPCDir) is False:
         os.makedirs(managerIPCDir)
-        os.chmod(managerIPCDir, 0777)
+        os.chmod(managerIPCDir, 0o777)
 
     try:
         with open(path, permission) as dispFile:
@@ -63,7 +76,7 @@ def _write_data(dictionary):
             dispFile.write(json.dumps(data))
             dispFile.truncate()
 
-        os.chmod(path, 0777)
+        os.chmod(path, 0o777)
 
     except Exception as e:
         LOG.error(e)
@@ -73,9 +86,11 @@ def _write_data(dictionary):
 
 
 def _read_data():
-    """ Reads the file in (/tmp/mycroft/ipc/managers/disp_info)
-        and returns the the data as python dict
+    """ Writes the dictionary of state data from the IPC directory.
+    Returns:
+        dict: loaded state information
     """
+    managerIPCDir = os.path.join(get_ipc_directory(), "managers")
 
     path = os.path.join(managerIPCDir, "disp_info")
     permission = "r" if os.path.isfile(path) else "w+"
@@ -100,15 +115,16 @@ def _read_data():
 
 def set_active(skill_name):
     """ Sets skill name as active in the display Manager
-        args:
-            string: skill_name
+    Args:
+        string: skill_name
     """
     _write_data({"active_skill": skill_name})
-    LOG.info("Setting active skill to " + skill_name)
 
 
 def get_active():
-    """ Get active skill in the display manager
+    """ Get the currenlty active skill from the display manager
+    Returns:
+        string: The active skill's name
     """
     data = _read_data()
     active_skill = ""
@@ -120,15 +136,14 @@ def get_active():
 
 
 def remove_active():
-    """ Remove the active skill in the skill manager
-    """
-    LOG.error("Removing active skill...")
+    """ Clears the active skill """
+    LOG.debug("Removing active skill...")
     _write_data({"active_skill": ""})
 
 
 def initiate_display_manager_ws():
-    """ Initiates the web sockets on the display_manager
-    """
+    """ Initiates the web sockets on the display_manager """
+    LOG.info("Initiating display manager websocket")
 
     # Should remove needs to be an object so it can be referenced in functions
     # [https://stackoverflow.com/questions/986006/how-do-i-pass-a-variable-by-reference]

@@ -1,28 +1,26 @@
-# Copyright 2016 Mycroft AI, Inc.
+# Copyright 2017 Mycroft AI Inc.
 #
-# This file is part of Mycroft Core.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-# Mycroft Core is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
+#    http://www.apache.org/licenses/LICENSE-2.0
 #
-# Mycroft Core is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 #
-# You should have received a copy of the GNU General Public License
-# along with Mycroft Core.  If not, see <http://www.gnu.org/licenses/>.
-
-
-import pystache
-import os
 import random
-from mycroft.util import log, resolve_resource_file
+from io import open
 
-__author__ = 'seanfitz'
-logger = log.getLogger(__name__)
+import os
+import re
+
+from mycroft.util import resolve_resource_file
+from mycroft.util.log import LOG
+
 
 __doc__ = """
 
@@ -33,6 +31,7 @@ class MustacheDialogRenderer(object):
     """
     A dialog template renderer based on the mustache templating language.
     """
+
     def __init__(self):
         self.templates = {}
 
@@ -50,9 +49,16 @@ class MustacheDialogRenderer(object):
                 if template_name not in self.templates:
                     self.templates[template_name] = []
 
+                # convert to standard python format string syntax. From
+                # double (or more) '{' followed by any number of whitespace
+                # followed by actual key followed by any number of whitespace
+                # followed by double (or more) '}'
+                template_text = re.sub('\{\{+\s*(.*?)\s*\}\}+', r'{\1}',
+                                       template_text)
+
                 self.templates[template_name].append(template_text)
 
-    def render(self, template_name, context={}, index=None):
+    def render(self, template_name, context=None, index=None):
         """
         Given a template name, pick a template and render it using the context
 
@@ -69,6 +75,7 @@ class MustacheDialogRenderer(object):
             NotImplementedError: if no template can be found identified by
                 template_name
         """
+        context = context or {}
         if template_name not in self.templates:
             raise NotImplementedError("Template not found: %s" % template_name)
         template_functions = self.templates.get(template_name)
@@ -76,13 +83,16 @@ class MustacheDialogRenderer(object):
             index = random.randrange(len(template_functions))
         else:
             index %= len(template_functions)
-        return pystache.render(template_functions[index], context)
+        line = template_functions[index]
+        line = line.format(**context)
+        return line
 
 
 class DialogLoader(object):
     """
     Loads a collection of dialog files into a renderer implementation.
     """
+
     def __init__(self, renderer_factory=MustacheDialogRenderer):
         self.__renderer = renderer_factory()
 
@@ -97,7 +107,7 @@ class DialogLoader(object):
             a loaded instance of a dialog renderer
         """
         if not os.path.exists(dialog_dir) or not os.path.isdir(dialog_dir):
-            logger.warn("No dialog found: " + dialog_dir)
+            LOG.warning("No dialog found: " + dialog_dir)
             return self.__renderer
 
         for f in sorted(
@@ -126,13 +136,13 @@ def get(phrase, lang=None, context=None):
     """
 
     if not lang:
-        from mycroft.configuration import ConfigurationManager
-        lang = ConfigurationManager.instance().get("lang")
+        from mycroft.configuration import Configuration
+        lang = Configuration.get().get("lang")
 
-    filename = "text/"+lang.lower()+"/"+phrase+".dialog"
+    filename = "text/" + lang.lower() + "/" + phrase + ".dialog"
     template = resolve_resource_file(filename)
     if not template:
-        logger.debug("Resource file not found: " + filename)
+        LOG.debug("Resource file not found: " + filename)
         return phrase
 
     stache = MustacheDialogRenderer()

@@ -1,56 +1,57 @@
-""" Copyright 2016 Mycroft AI, Inc.
-
- This file is part of Mycroft Core.
-
- Mycroft Core is free software: you can redistribute it and/or modify
- it under the terms of the GNU General Public License as published by
- the Free Software Foundation, either version 3 of the License, or
- (at your option) any later version.
-
- Mycroft Core is distributed in the hope that it will be useful,
- but WITHOUT ANY WARRANTY; without even the implied warranty of
- MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- GNU General Public License for more details.
-
- You should have received a copy of the GNU General Public License
- along with Mycroft Core.  If not, see <http://www.gnu.org/licenses/>.
-"""
-
+# Copyright 2017 Mycroft AI Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+import audioop
 import collections
 import datetime
-import os
-from time import sleep
-import audioop
+from hashlib import md5
+import shutil
+from tempfile import gettempdir
+from threading import Thread, Lock
+from time import sleep, time as get_time
 
+import os
 import pyaudio
 import speech_recognition
+from os import mkdir
+from os.path import isdir, join, expanduser, isfile
 from speech_recognition import (
     Microphone,
     AudioSource,
     AudioData
 )
+import requests
+from subprocess import check_output
 
-from mycroft.configuration import ConfigurationManager
+from mycroft.api import DeviceApi
+from mycroft.configuration import Configuration
+from mycroft.session import SessionManager
 from mycroft.util import (
     check_for_signal,
     get_ipc_directory,
     resolve_resource_file,
     play_wav
 )
-from mycroft.util.log import getLogger
-
-config = ConfigurationManager.instance()
-listener_config = config.get('listener')
-logger = getLogger(__name__)
-__author__ = 'seanfitz'
+from mycroft.util.log import LOG
 
 
 class MutableStream(object):
-
     def __init__(self, wrapped_stream, format, muted=False):
         assert wrapped_stream is not None
         self.wrapped_stream = wrapped_stream
         self.muted = muted
+
         self.SAMPLE_WIDTH = pyaudio.get_sample_size(format)
         self.muted_buffer = b''.join([b'\x00' * self.SAMPLE_WIDTH])
 
@@ -60,7 +61,18 @@ class MutableStream(object):
     def unmute(self):
         self.muted = False
 
-    def read(self, size):
+    def read(self, size, of_exc=False):
+        """
+            Read data from stream.
+
+            Arguments:
+                size (int): Number of bytes to read
+                of_exc (bool): flag determining if the audio producer thread
+                               should throw IOError at overflows.
+
+            Returns:
+                Data read from device
+        """
         frames = collections.deque()
         remaining = size
         while remaining > 0:
@@ -68,7 +80,8 @@ class MutableStream(object):
             if to_read == 0:
                 sleep(.01)
                 continue
-            result = self.wrapped_stream.read(to_read)
+            result = self.wrapped_stream.read(to_read,
+                                              exception_on_overflow=of_exc)
             frames.append(result)
             remaining -= to_read
 
@@ -76,7 +89,7 @@ class MutableStream(object):
             return self.muted_buffer
         input_latency = self.wrapped_stream.get_input_latency()
         if input_latency > 0.2:
-            logger.warn("High input latency: %f" % input_latency)
+            LOG.warning("High input latency: %f" % input_latency)
         audio = b"".join(list(frames))
         return audio
 
@@ -92,12 +105,14 @@ class MutableStream(object):
 
 
 class MutableMicrophone(Microphone):
-
-    def __init__(self, device_index=None, sample_rate=16000, chunk_size=1024):
+    def __init__(self, device_index=None, sample_rate=16000, chunk_size=1024,
+                 mute=False):
         Microphone.__init__(
             self, device_index=device_index, sample_rate=sample_rate,
             chunk_size=chunk_size)
         self.muted = False
+        if mute:
+            self.mute()
 
     def __enter__(self):
         assert self.stream is None, \
@@ -132,6 +147,10 @@ class MutableMicrophone(Microphone):
         return self.muted
 
 
+def get_silence(num_bytes):
+    return b'\0' * num_bytes
+
+
 class ResponsiveRecognizer(speech_recognition.Recognizer):
     # Padding of silence when feeding to pocketsphinx
     SILENCE_SEC = 0.01
@@ -156,11 +175,13 @@ class ResponsiveRecognizer(speech_recognition.Recognizer):
     SEC_BETWEEN_WW_CHECKS = 0.2
 
     def __init__(self, wake_word_recognizer):
-        # The maximum audio in seconds to keep for transcribing a phrase
-        # The wake word must fit in this time
-        num_phonemes = len(listener_config.get('phonemes').split())
-        len_phoneme = listener_config.get('phoneme_duration', 120) / 1000.0
-        self.SAVED_WW_SEC = num_phonemes * len_phoneme
+
+        self.config = Configuration.get()
+        listener_config = self.config.get('listener')
+        self.upload_config = listener_config.get('wake_word_upload')
+        self.wake_word_name = wake_word_recognizer.key_phrase
+
+        self.overflow_exc = listener_config.get('overflow_exception', False)
 
         speech_recognition.Recognizer.__init__(self)
         self.wake_word_recognizer = wake_word_recognizer
@@ -168,13 +189,30 @@ class ResponsiveRecognizer(speech_recognition.Recognizer):
         self.multiplier = listener_config.get('multiplier')
         self.energy_ratio = listener_config.get('energy_ratio')
         # check the config for the flag to save wake words.
-        self.save_wake_words = listener_config.get('record_wake_words')
+
+        self.save_utterances = listener_config.get('record_utterances', False)
+        self.save_wake_words = listener_config.get('record_wake_words') \
+            or self.upload_config['enable'] or self.config['opt_in']
+        self.upload_lock = Lock()
+        self.save_wake_words_dir = join(gettempdir(), 'mycroft_wake_words')
+        self.filenames_to_upload = []
         self.mic_level_file = os.path.join(get_ipc_directory(), "mic_level")
         self._stop_signaled = False
 
-    @staticmethod
-    def record_sound_chunk(source):
-        return source.stream.read(source.CHUNK)
+        # The maximum audio in seconds to keep for transcribing a phrase
+        # The wake word must fit in this time
+        num_phonemes = wake_word_recognizer.num_phonemes
+        len_phoneme = listener_config.get('phoneme_duration', 120) / 1000.0
+        self.TEST_WW_SEC = num_phonemes * len_phoneme
+        self.SAVED_WW_SEC = 10 if self.save_wake_words else self.TEST_WW_SEC
+
+        try:
+            self.account_id = DeviceApi().get()['user']['uuid']
+        except (requests.RequestException, AttributeError):
+            self.account_id = '0'
+
+    def record_sound_chunk(self, source):
+        return source.stream.read(source.CHUNK, self.overflow_exc)
 
     @staticmethod
     def calc_energy(sound_chunk, sample_width):
@@ -226,7 +264,7 @@ class ResponsiveRecognizer(speech_recognition.Recognizer):
                                     sec_per_buffer)
 
         # bytearray to store audio in
-        byte_data = '\0' * source.SAMPLE_WIDTH
+        byte_data = get_silence(source.SAMPLE_WIDTH)
 
         phrase_complete = False
         while num_chunks < max_chunks and not phrase_complete:
@@ -271,7 +309,7 @@ class ResponsiveRecognizer(speech_recognition.Recognizer):
 
     @staticmethod
     def sec_to_bytes(sec, source):
-        return sec * source.SAMPLE_RATE * source.SAMPLE_WIDTH
+        return int(sec * source.SAMPLE_RATE) * source.SAMPLE_WIDTH
 
     def _skip_wake_word(self):
         # Check if told programatically to skip the wake word, like
@@ -288,7 +326,7 @@ class ResponsiveRecognizer(speech_recognition.Recognizer):
             if check_for_signal('buttonPress'):
                 # Signal is still here, assume it was intended to
                 # begin recording
-                logger.debug("Button Pressed, wakeword not needed")
+                LOG.debug("Button Pressed, wakeword not needed")
                 return True
 
         return False
@@ -298,6 +336,36 @@ class ResponsiveRecognizer(speech_recognition.Recognizer):
             Signal stop and exit waiting state.
         """
         self._stop_signaled = True
+
+    def _upload_file(self, filename):
+        server = self.upload_config['server']
+        keyfile = resolve_resource_file('wakeword_rsa')
+        userfile = expanduser('~/.mycroft/wakeword_rsa')
+
+        if not isfile(userfile):
+            shutil.copy2(keyfile, userfile)
+            os.chmod(userfile, 0o600)
+            keyfile = userfile
+
+        address = self.upload_config['user'] + '@' + \
+            server + ':' + self.upload_config['folder']
+
+        self.upload_lock.acquire()
+        try:
+            self.filenames_to_upload.append(filename)
+            for i, fn in enumerate(self.filenames_to_upload):
+                LOG.debug('Uploading ' + fn + '...')
+                os.chmod(fn, 0o666)
+                cmd = 'scp -o StrictHostKeyChecking=no -P ' + \
+                      str(self.upload_config['port']) + ' -i ' + \
+                      keyfile + ' ' + fn + ' ' + address
+                if os.system(cmd) == 0:
+                    del self.filenames_to_upload[i]
+                    os.remove(fn)
+                else:
+                    LOG.debug('Could not upload ' + fn + ' to ' + server)
+        finally:
+            self.upload_lock.release()
 
     def _wait_until_wake_word(self, source, sec_per_buffer):
         """Listen continuously on source until a wake word is spoken
@@ -309,7 +377,7 @@ class ResponsiveRecognizer(speech_recognition.Recognizer):
         num_silent_bytes = int(self.SILENCE_SEC * source.SAMPLE_RATE *
                                source.SAMPLE_WIDTH)
 
-        silence = '\0' * num_silent_bytes
+        silence = get_silence(num_silent_bytes)
 
         # bytearray to store audio in
         byte_data = silence
@@ -319,6 +387,7 @@ class ResponsiveRecognizer(speech_recognition.Recognizer):
 
         # Max bytes for byte_data before audio is removed from the front
         max_size = self.sec_to_bytes(self.SAVED_WW_SEC, source)
+        test_size = self.sec_to_bytes(self.TEST_WW_SEC, source)
 
         said_wake_word = False
 
@@ -330,6 +399,12 @@ class ResponsiveRecognizer(speech_recognition.Recognizer):
         avg_energy = 0.0
         energy_avg_samples = int(5 / sec_per_buffer)  # avg over last 5 secs
 
+        ww_module = self.wake_word_recognizer.__class__.__name__
+        if ww_module == 'PreciseHotword':
+            _, model_path = self.wake_word_recognizer.get_model_info()
+            model_hash = check_output(['md5sum', model_path]).split()[0]
+        else:
+            model_hash = '0'
         counter = 0
 
         while not said_wake_word and not self._stop_signaled:
@@ -344,19 +419,19 @@ class ResponsiveRecognizer(speech_recognition.Recognizer):
             if len(energies) < energy_avg_samples:
                 # build the average
                 energies.append(energy)
-                avg_energy += float(energy)/energy_avg_samples
+                avg_energy += float(energy) / energy_avg_samples
             else:
                 # maintain the running average and rolling buffer
-                avg_energy -= float(energies[idx_energy])/energy_avg_samples
-                avg_energy += float(energy)/energy_avg_samples
+                avg_energy -= float(energies[idx_energy]) / energy_avg_samples
+                avg_energy += float(energy) / energy_avg_samples
                 energies[idx_energy] = energy
-                idx_energy = (idx_energy+1) % energy_avg_samples
+                idx_energy = (idx_energy + 1) % energy_avg_samples
 
                 # maintain the threshold using average
-                if energy < avg_energy*1.5:
+                if energy < avg_energy * 1.5:
                     if energy > self.energy_threshold:
                         # bump the threshold to just above this value
-                        self.energy_threshold = energy*1.2
+                        self.energy_threshold = energy * 1.2
 
             # Periodically output energy level stats.  This can be used to
             # visualize the microphone input, e.g. a needle on a meter.
@@ -376,19 +451,39 @@ class ResponsiveRecognizer(speech_recognition.Recognizer):
                 byte_data = byte_data[len(chunk):] + chunk
 
             buffers_since_check += 1.0
+            self.wake_word_recognizer.update(chunk)
             if buffers_since_check > buffers_per_check:
                 buffers_since_check -= buffers_per_check
-                audio_data = byte_data + silence
+                chopped = byte_data[-test_size:] \
+                    if test_size < len(byte_data) else byte_data
+                audio_data = chopped + silence
                 said_wake_word = \
                     self.wake_word_recognizer.found_wake_word(audio_data)
                 # if a wake word is success full then record audio in temp
                 # file.
                 if self.save_wake_words and said_wake_word:
-                    audio = self.create_audio_data(audio_data, source)
-                    stamp = str(datetime.datetime.now())
-                    filename = "/tmp/mycroft_wake_success%s.wav" % stamp
-                    with open(filename, 'wb') as filea:
-                        filea.write(audio.get_wav_data())
+                    audio = self._create_audio_data(byte_data, source)
+
+                    if not isdir(self.save_wake_words_dir):
+                        mkdir(self.save_wake_words_dir)
+                    dr = self.save_wake_words_dir
+
+                    components = [
+                        self.wake_word_name.replace(' ', '-'),
+                        md5(ww_module.encode('utf-8')).hexdigest(),
+                        str(int(1000 * get_time())),
+                        SessionManager.get().session_id,
+                        self.account_id,
+                        model_hash
+                    ]
+                    fn = join(dr, '.'.join(components) + '.wav')
+                    with open(fn, 'wb') as f:
+                        f.write(audio.get_wav_data())
+
+                    if self.upload_config['enable'] or self.config['opt_in']:
+                        t = Thread(target=self._upload_file, args=(fn,))
+                        t.daemon = True
+                        t.start()
 
     @staticmethod
     def _create_audio_data(raw_data, source):
@@ -415,7 +510,7 @@ class ResponsiveRecognizer(speech_recognition.Recognizer):
         """
         assert isinstance(source, AudioSource), "Source must be an AudioSource"
 
-#        bytes_per_sec = source.SAMPLE_RATE * source.SAMPLE_WIDTH
+        #        bytes_per_sec = source.SAMPLE_RATE * source.SAMPLE_WIDTH
         sec_per_buffer = float(source.CHUNK) / source.SAMPLE_RATE
 
         # Every time a new 'listen()' request begins, reset the threshold
@@ -425,26 +520,32 @@ class ResponsiveRecognizer(speech_recognition.Recognizer):
         #       speech is detected, but there is no code to actually do that.
         self.adjust_for_ambient_noise(source, 1.0)
 
-        logger.debug("Waiting for wake word...")
+        LOG.debug("Waiting for wake word...")
         self._wait_until_wake_word(source, sec_per_buffer)
         if self._stop_signaled:
             return
 
-        logger.debug("Recording...")
+        LOG.debug("Recording...")
         emitter.emit("recognizer_loop:record_begin")
 
         # If enabled, play a wave file with a short sound to audibly
         # indicate recording has begun.
-        if config.get('confirm_listening'):
+        if self.config.get('confirm_listening'):
             file = resolve_resource_file(
-                config.get('sounds').get('start_listening'))
+                self.config.get('sounds').get('start_listening'))
             if file:
                 play_wav(file)
 
         frame_data = self._record_phrase(source, sec_per_buffer)
         audio_data = self._create_audio_data(frame_data, source)
         emitter.emit("recognizer_loop:record_end")
-        logger.debug("Thinking...")
+        if self.save_utterances:
+            LOG.info("Recording utterance")
+            stamp = str(datetime.datetime.now())
+            filename = "/tmp/mycroft_utterance%s.wav" % stamp
+            with open(filename, 'wb') as filea:
+                filea.write(audio_data.get_wav_data())
+            LOG.debug("Thinking...")
 
         return audio_data
 

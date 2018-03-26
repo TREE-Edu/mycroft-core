@@ -1,28 +1,21 @@
-# Copyright 2016 Mycroft AI, Inc.
+# Copyright 2017 Mycroft AI Inc.
 #
-# This file is part of Mycroft Core.
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-# Mycroft Core is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
+#    http://www.apache.org/licenses/LICENSE-2.0
 #
-# Mycroft Core is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 #
-# You should have received a copy of the GNU General Public License
-# along with Mycroft Core.  If not, see <http://www.gnu.org/licenses/>.
+from PIL import Image
 
 import mycroft.client.enclosure.display_manager as DisplayManager
 from mycroft.messagebus.message import Message
-from mycroft.util.log import getLogger
-from PIL import Image
-
-__author__ = 'jdorleans'
-
-LOGGER = getLogger(__name__)
 
 
 '''
@@ -124,6 +117,30 @@ class EnclosureAPI:
         self.ws.emit(Message("enclosure.eyes.color",
                              {'r': r, 'g': g, 'b': b}))
 
+    def eyes_setpixel(self, idx, r=255, g=255, b=255):
+        """Set individual pixels of the Mark 1 neopixel eyes
+        Args:
+            idx (int): 0-11 for the right eye, 12-23 for the left
+            r (int): The red value to apply
+            g (int): The green value to apply
+            b (int): The blue value to apply
+        """
+        if idx < 0 or idx > 23:
+            raise ValueError('idx ({}) must be between 0-23'.format(str(idx)))
+        self.ws.emit(Message("enclosure.eyes.setpixel",
+                             {'idx': idx, 'r': r, 'g': g, 'b': b}))
+
+    def eyes_fill(self, percentage):
+        """Use the eyes as a type of progress meter
+        Args:
+            amount (int): 0-49 fills the right eye, 50-100 also covers left
+        """
+        if percentage < 0 or percentage > 100:
+            raise ValueError('percentage ({}) must be between 0-100'.
+                             format(str(percentage)))
+        self.ws.emit(Message("enclosure.eyes.fill",
+                             {'percentage': percentage}))
+
     def eyes_brightness(self, level=30):
         """Set the brightness of the eyes in the display.
         Args:
@@ -134,6 +151,11 @@ class EnclosureAPI:
     def eyes_reset(self):
         """Restore the eyes to their default (ready) state."""
         self.ws.emit(Message("enclosure.eyes.reset"))
+
+    def eyes_spin(self):
+        """Make the eyes 'roll'
+        """
+        self.ws.emit(Message("enclosure.eyes.spin"))
 
     def eyes_timed_spin(self, length):
         """Make the eyes 'roll' for the given time.
@@ -148,6 +170,9 @@ class EnclosureAPI:
         Args:
             volume (int): 0 to 11
         """
+        if volume < 0 or volume > 11:
+            raise ValueError('volume ({}) must be between 0-11'.
+                             format(str(volume)))
         self.ws.emit(Message("enclosure.eyes.volume", {'volume': volume}))
 
     def mouth_reset(self):
@@ -175,7 +200,7 @@ class EnclosureAPI:
         self.ws.emit(Message("enclosure.mouth.smile"))
         DisplayManager.set_active(self.name)
 
-    def mouth_viseme(self, code):
+    def mouth_viseme(self, code, time_until=0):
         """Display a viseme mouth shape for synched speech
         Args:
             code (int):  0 = shape for sounds like 'y' or 'aa'
@@ -185,8 +210,11 @@ class EnclosureAPI:
                          4 = neutral shape for no sound
                          5 = shape for sounds like 'f' or 'v'
                          6 = shape for sounds like 'oy' or 'ao'
+            time_until (float): (optional) For timing, time.time() when this
+                         shape expires, or 0 for display regardles of time
         """
-        self.ws.emit(Message("enclosure.mouth.viseme", {'code': code}))
+        self.ws.emit(Message("enclosure.mouth.viseme", {'code': code,
+                                                        'until': time_until}))
 
     def mouth_text(self, text=""):
         """Display text (scrolling as needed)
@@ -206,7 +234,7 @@ class EnclosureAPI:
             y (int): y offset for image
             refresh (bool): specify whether to clear the faceplate before
                             displaying the new image or not.
-                            Useful if you'd like to display muliple images
+                            Useful if you'd like to display multiple images
                             on the faceplate at once.
         """
         DisplayManager.set_active(self.name)
